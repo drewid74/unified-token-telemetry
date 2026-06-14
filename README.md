@@ -2,6 +2,9 @@
 
 Single Postgres fact table for all AI token usage. Covers LiteLLM (via Prometheus), GitHub Copilot (daily API), OpenAI Organization API, Anthropic Admin API, fixed subscriptions (ChatGPT Plus/Pro, Claude Pro, Gemini Advanced, Perplexity Pro, Cursor, Windsurf), and manual imports. Direct Postgres upserts — no Redis, no per-request events.
 
+<img width="2220" height="1197" alt="image" src="https://github.com/user-attachments/assets/d402209d-2f63-4140-8dd6-e60e626210fd" />
+
+
 ## Dependencies
 
 | Dependency | Version | Required | Purpose |
