@@ -1,0 +1,172 @@
+# unified-token-telemetry config template
+# Copy to instances/{name}/config.yaml and fill in all fields.
+# Do NOT commit secrets. Use environment variables for credentials.
+
+postgres:
+  host: "${TELEMETRY_PG_HOST}"        # Override with actual host in instances/*/config.yaml
+  port: "${TELEMETRY_PG_PORT}"        # Postgres port
+  database: "${TELEMETRY_PG_DB}"      # Database name
+  schema: "telemetry"                 # Schema within the database (matches {{schema}} in SQL files)
+  user: "${TELEMETRY_PG_USER}"
+  password: "${TELEMETRY_PG_PASSWORD}"
+  ssl: false
+
+identity:
+  user_id: null                       # Set to a user identifier for user-scoped rows; null = org-level
+
+scheduler:
+  interval_minutes: 60               # How often the worker runs (hourly for LiteLLM)
+  lag_minutes: 5                     # Don't collect windows ending less than N minutes ago (avoid partial windows)
+
+sources:
+  litellm:
+    enabled: true
+    prometheus:
+      url: "${LITELLM_PROMETHEUS_URL}"  # Prometheus endpoint that scrapes LiteLLM
+      job_name: "litellm_panopticon"    # Prometheus job label for LiteLLM scrape target
+    # Metrics queried:
+    #   litellm_input_tokens_metric_total
+    #   litellm_output_tokens_metric_total
+    #   litellm_cached_tokens_metric_total (read tokens)
+    # Granularity: hour
+
+  copilot:
+    enabled: false
+    github:
+      token: "${GITHUB_TOKEN}"        # PAT with read:org or copilot:read scope
+      org: "${GITHUB_ORG}"           # GitHub organization name
+    # API: /orgs/{org}/copilot/metrics/reports/organization-1-day?day=YYYY-MM-DD
+    # Note: old /copilot/usage endpoint retired 2026-04-02
+    # cached_read_tokens will always be null (Copilot reports no cache data)
+    # Granularity: day
+
+  openai:
+    enabled: false
+    api_key: "${OPENAI_ADMIN_KEY}"    # Organization-level API key (needs org admin scope)
+    org_id: "${OPENAI_ORG_ID}"        # Optional: org-xxxxx (required for multi-org keys)
+    # API: GET /v1/organization/usage/completions + /v1/organization/costs
+    # Returns: input_tokens, output_tokens, num_model_requests, cost per model per day
+    # cached_read_tokens: null (OpenAI includes cached in input_tokens, no separate field)
+    # Granularity: day (bucket_width=1d)
+
+  anthropic:
+    enabled: false
+    admin_api_key: "${ANTHROPIC_ADMIN_KEY}"  # Admin key: sk-ant-admin-... (requires org admin role)
+    # API: GET /v1/organizations/usage_report/messages + /cost_report
+    # Returns: uncached_input_tokens, cache_read_input_tokens, cache_creation (5m+1h), output_tokens
+    # cached_read_tokens: YES (Anthropic reports cache separately)
+    # cached_write_tokens: YES (ephemeral_5m + ephemeral_1h combined)
+    # Granularity: day (bucket_width=1d)
+
+  subscriptions:
+    enabled: false
+    # Fixed monthly subscriptions — no token data, cost tracking only.
+    # Each plan emits one record per billing cycle with cost_usd and zero tokens.
+    # measurement_basis = 'derived_estimate'
+    plans:
+      - name: chatgpt_plus
+        enabled: true
+        provider: openai
+        plan: "ChatGPT Plus"
+        monthly_cost_usd: 20.00
+        billing_day: 1              # Day of month subscription renews
+
+      - name: chatgpt_pro
+        enabled: false
+        provider: openai
+        plan: "ChatGPT Pro"
+        monthly_cost_usd: 200.00
+        billing_day: 1
+
+      - name: claude_pro
+        enabled: true
+        provider: anthropic
+        plan: "Claude Pro"
+        monthly_cost_usd: 20.00
+        billing_day: 1
+
+      - name: claude_max
+        enabled: false
+        provider: anthropic
+        plan: "Claude Max"
+        monthly_cost_usd: 100.00
+        billing_day: 1
+
+      - name: gemini_advanced
+        enabled: true
+        provider: google
+        plan: "Gemini Advanced"
+        monthly_cost_usd: 20.00
+        billing_day: 1
+
+      - name: perplexity_pro
+        enabled: true
+        provider: perplexity
+        plan: "Perplexity Pro"
+        monthly_cost_usd: 20.00
+        billing_day: 1
+
+      - name: cursor_pro
+        enabled: false
+        provider: cursor
+        plan: "Cursor Pro"
+        monthly_cost_usd: 20.00
+        billing_day: 1
+
+      - name: cursor_ultra
+        enabled: false
+        provider: cursor
+        plan: "Cursor Ultra"
+        monthly_cost_usd: 40.00
+        billing_day: 1
+
+      - name: windsurf_pro
+        enabled: false
+        provider: windsurf
+        plan: "Windsurf Pro"
+        monthly_cost_usd: 15.00
+        billing_day: 1
+
+      - name: windsurf_ultra
+        enabled: false
+        provider: windsurf
+        plan: "Windsurf Ultra"
+        monthly_cost_usd: 60.00
+        billing_day: 1
+
+  manual:
+    enabled: false
+    source_path: "./data/manual-import.csv"  # Path to CSV or JSON file
+    source_format: "csv"             # csv or json
+    # CSV expected columns: date, model_id, input_tokens, output_tokens, cost_usd
+
+consumers:
+  dashboard:
+    enabled: true
+    port: 3000                       # Local dashboard port if running nextjs consumer
+
+  grafana:
+    enabled: true
+    url: "${GRAFANA_URL}"            # Grafana instance URL (for API-based provisioning)
+    api_key: "${GRAFANA_API_KEY}"    # Optional: for automated dashboard import
+
+pricing:
+  enabled: true                      # Calculate cost_usd from token counts using pricing table
+  # Pricing is loaded from pricing.json or overridden here per model
+  # Format: model_id -> { input_per_million, output_per_million, cache_read_per_million }
+  models:
+    # Add model pricing overrides here if needed
+    # "claude-3-5-sonnet-20241022":
+    #   input_per_million: 3.00
+    #   output_per_million: 15.00
+    #   cache_read_per_million: 0.30
+
+backfill:
+  enabled: false
+  default_start: "2024-01-01T00:00:00Z"  # ISO 8601; used if no prior data exists
+  max_days: 90                            # Don't backfill more than N days per run
+
+verification:
+  enabled: true
+  run_after_collect: true           # Run verification.sql checks after each collection cycle
+  alert_on_stale_hours: 26          # Alert if any source has no data newer than N hours

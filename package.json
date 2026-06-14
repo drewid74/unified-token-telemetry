@@ -1,0 +1,20 @@
+{
+  "name": "unified-token-telemetry",
+  "version": "1.0.0",
+  "description": "Single Postgres fact table for all AI token usage — LiteLLM, Copilot, manual imports",
+  "main": "templates/worker.template.js",
+  "scripts": {
+    "verify": "bash templates/consumers/verification-runner.sh",
+    "worker": "node templates/worker.template.js"
+  },
+  "keywords": ["tokens", "telemetry", "litellm", "copilot", "prometheus", "grafana"],
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "pg": "^8.21.0"
+  }
+}
