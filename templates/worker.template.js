@@ -271,27 +271,32 @@ async function upsertRecords(pool, schema, records) {
 //     that this layer surfaces.
 //
 // Tune SOURCE_THRESHOLDS_SECONDS to match your collection cadence. Defaults
-// below reflect a typical multi-source deployment.
+// below cover the 6 PUBLIC adapters shipped in templates/adapters/ plus FOUR
+// example extension-pattern names (opencode / copilot_otel / codex_cli /
+// anthropic_desktop) that you can wire up as instance-side daemons writing
+// directly into token_usage. Those four are NOT shipped as public adapters —
+// they're listed here as reference cadences for common collector patterns.
+// Add or remove entries to match the source_systems YOUR deployment writes.
 
 const SOURCE_THRESHOLDS_SECONDS = {
-  // High-frequency sources (15-min cycle or faster)
-  litellm:           30 * 60,        // 2x cycle interval
-  opencode:          45 * 60,        // 3x cycle interval (more tolerant of empty polls)
+  // ── Public adapters (templates/adapters/) ─────────────────────────────
+  litellm:           30 * 60,        // litellm-prometheus  (2x 15-min cycle)
+  copilot:           30 * 3600,      // copilot-daily       (daily + 6h buffer)
+  openai_api:        30 * 3600,      // openai-usage        (daily + 6h buffer)
+  anthropic_api:     30 * 3600,      // anthropic-usage     (daily + 6h buffer)
+  subscription:      35 * 86400,     // subscription        (monthly + 5d buffer)
+  // (manual-import is event-driven, no freshness threshold by default)
 
-  // Bursty sources (only write on activity; long quiet windows are normal)
-  copilot_otel:      24 * 3600,      // VS Code chat sessions
-  codex_cli:         24 * 3600,      // Codex CLI sessions
+  // ── Extension-pattern examples (NOT public adapters — wire your own) ──
+  // These names are common instance-side daemons. Remove the entries you
+  // don't use; otherwise the freshness checker will perma-tag them
+  // 'never_seen' (which is informational only, not a failure).
+  opencode:          45 * 60,        // opencode session SQLite tailer    (3x 15-min)
+  copilot_otel:      24 * 3600,      // VS Code Copilot Chat OTel SQLite  (bursty)
+  codex_cli:         24 * 3600,      // Codex CLI session JSONL tailer    (bursty)
+  anthropic_desktop: 30 * 3600,      // Claude Desktop session JSONL      (daily + 6h)
 
-  // Daily-cadence collectors (poll once per day)
-  anthropic_desktop: 30 * 3600,      // 1 day + 6h buffer
-  copilot:           30 * 3600,      // Copilot daily API
-  openai_api:        30 * 3600,      // OpenAI Org Usage API
-  anthropic_api:     30 * 3600,      // Anthropic Org Usage API
-
-  // Monthly cadence
-  subscription:      35 * 86400,     // monthly + 5d buffer
-
-  // Dead-man's-switch — must match the rollup cycle interval (2x)
+  // ── Dead-man's-switch (must match the worker cycle interval × 2) ──────
   __heartbeat__:     30 * 60,
 };
 

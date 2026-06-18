@@ -52,27 +52,30 @@ bash templates/consumers/verification-runner.sh
 ```
 templates/              # Generic, config-driven templates (no hardcoded values)
 ├── config.template.yaml
-├── worker.template.js
-├── adapters/           # Source-specific collectors
-│   ├── adapter.template.js              # Blank adapter skeleton
-│   ├── litellm-prometheus.adapter.js    # LiteLLM via Prometheus (covers Ollama/vLLM backends)
-│   ├── copilot-daily.adapter.js         # GitHub Copilot daily API
-│   ├── openai-usage.adapter.js          # OpenAI Organization Usage API (daily)
-│   ├── anthropic-usage.adapter.js       # Anthropic Admin Usage API (daily, with cache breakdown)
-│   ├── subscription.adapter.js          # Fixed monthly subscriptions (any plan)
-│   └── manual-import.adapter.js         # CSV/JSON manual ingest
-└── consumers/          # Output/visualization
+├── migration.template.sql
+├── worker.template.js                    # Multi-source worker + freshness checker + watermark backfill
+├── adapters/
+│   ├── adapter.template.js               # Blank adapter skeleton
+│   ├── litellm-prometheus.adapter.js     # LiteLLM via Prometheus (covers Ollama/vLLM/cloud routed through LiteLLM)
+│   ├── copilot-daily.adapter.js          # GitHub Copilot daily API
+│   ├── openai-usage.adapter.js           # OpenAI Organization Usage API (daily)
+│   ├── anthropic-usage.adapter.js        # Anthropic Admin Usage API (daily, with cache breakdown)
+│   ├── subscription.adapter.js           # Fixed monthly subscriptions (any plan)
+│   └── manual-import.adapter.js          # CSV/JSON manual ingest
+└── consumers/
     ├── grafana-dashboard.json
     ├── nextjs-api-route.template.ts
-    └── verification-runner.sh
+    ├── verification-runner.sh
+    └── watchdog-reader.template.sh       # External freshness watchdog (cron, exit-code-based alerting)
 
-references/             # Specifications and contracts
-├── schema.sql          # Canonical DDL (17 columns, 2 enums)
-├── invariants.md       # Non-negotiable data rules
-├── adapter-contract.md # Adapter interface specification
-├── grafana-queries.sql # Panel SQL queries
-├── verification.sql    # Smoke test queries
-└── architecture.md     # System design overview
+references/             # Specifications, contracts, and lessons
+├── schema.sql                  # Canonical DDL: token_usage + watchdog_status + rollup_watermark
+├── invariants.md               # 13 non-negotiable data rules
+├── operational-lessons.md      # 9 real-world failures with durable fixes
+├── adapter-contract.md         # Adapter interface specification
+├── grafana-queries.sql         # Panel SQL queries
+├── verification.sql            # Smoke test queries
+└── architecture.md             # Data flow, freshness design, backfill algorithm
 
 instances/              # Per-deployment configs (gitignored)
 └── <your-name>/        # Your personal instance
@@ -90,16 +93,31 @@ SKILL.md                # Agent-facing README (for AI coding assistants)
 
 ## Adapter Coverage
 
-| Adapter | Source | Tokens | Cost | Cache | Granularity |
-|---|---|---|---|---|---|
-| `litellm-prometheus` | Any model behind LiteLLM (Ollama, vLLM, cloud APIs) | ✅ exact | ✅ computed | ✅ read | hour |
-| `copilot-daily` | GitHub Copilot org metrics | ✅ exact | ❌ | ❌ | day |
-| `openai-usage` | OpenAI Organization API (ChatGPT API, GPT-4, etc.) | ✅ exact | ✅ from API | ❌ | day |
-| `anthropic-usage` | Anthropic Admin API (Claude API usage) | ✅ exact | ✅ from API | ✅ read+write | day |
-| `subscription` | Any flat-fee plan (ChatGPT Plus/Pro, Claude Pro, Gemini, Perplexity, Cursor, Windsurf) | ❌ | ✅ fixed | ❌ | month |
-| `manual-import` | CSV/JSON file import | ✅ varies | ✅ if provided | varies | varies |
+| Adapter | `source_system` | Source | Tokens | Cost | Cache | Granularity | `measurement_basis` |
+|---|---|---|---|---|---|---|---|
+| `litellm-prometheus` | `litellm` | Any model behind LiteLLM (Ollama, vLLM, cloud APIs) | ✅ exact | ✅ computed by worker | ✅ read only (write always NULL) | hour | `exact` |
+| `copilot-daily` | `copilot` | GitHub Copilot org metrics | ✅ exact when API returns tokens; estimated from lines_accepted otherwise | ❌ | ❌ | day | `provider_aggregate` OR `derived_estimate` |
+| `openai-usage` | `openai_api` | OpenAI Organization Usage API | ✅ exact | ✅ from Costs API | ❌ | day | `exact` |
+| `anthropic-usage` | `anthropic_api` | Anthropic Admin API (Claude API usage) | ✅ exact | ✅ from Cost Report API | ✅ read + write (5m + 1h ephemeral combined) | day | `exact` |
+| `subscription` | `subscription` | Any flat-fee plan (ChatGPT Plus/Pro, Claude Pro/Max, Gemini Advanced, Perplexity Pro, Cursor Pro/Ultra, Windsurf Pro/Ultra) | ❌ (NULL) | ✅ fixed from config | ❌ | month | `derived_estimate` |
+| `manual-import` | `manual` | CSV/JSON file import | ✅ if provided in input | ✅ if provided in input | ❌ (always NULL, regardless of input) | uses input `granularity` field or defaults to `day` | `derived_estimate` (hardcoded) |
+
+**Cost & cache notes:**
+- `litellm-prometheus` adapter writes `cost_usd = NULL`; the worker's `calcCost()` function computes cost from the `pricing:` block in `config.yaml` after the adapter returns records. To get cost data, you must populate the pricing config.
+- `manual-import` ignores any `cached_read_tokens` / `cached_write_tokens` in the input file and always writes NULL. If you need cache data from a manual import, use a custom adapter.
+- `subscription` is the only adapter where tokens are NULL by design — there's no per-request telemetry for a flat-fee plan, only the monthly bill.
 
 **Full-stack gateways** (Bifrost, Helicone, Portkey, WSO2, Kong) are intentionally excluded — they have their own observability. Use this skill for sources that don't already export to Prometheus/Grafana.
+
+## Freshness Monitoring (Phase 1)
+
+The worker writes per-source `watchdog_status` rows on every cycle and a `__heartbeat__` row about itself. A separate external watchdog script (`templates/consumers/watchdog-reader.template.sh`) reads those rows on its own schedule and exits non-zero on staleness. See `references/architecture.md` for the two-layer design and `references/invariants.md` §10-11 for why MAX(updated_at) and SOURCE_STATE_OVERRIDE matter.
+
+The `SOURCE_THRESHOLDS_SECONDS` map in `worker.template.js` ships with example thresholds for common sources beyond the 6 public adapters above — names like `opencode`, `copilot_otel`, `codex_cli`, and `anthropic_desktop` are present as reference cadences for daemons you might add as instance-side extensions (your own collectors that upsert directly into `token_usage`, NOT public adapters). Add or remove entries to match the source_systems your deployment actually writes.
+
+## Backfill After Downtime (Phase 2)
+
+The worker is watermark-driven via `rollup_watermark` and recovers up to `max_backfill_minutes` (24h default) of missed windows in a single cycle after the daemon comes back up. Uses Prometheus `query_range` for a single HTTP round-trip per metric regardless of gap size. See `references/architecture.md` "Backfill & Resume" for the full algorithm and `references/invariants.md` §12-13 for the alignment + query_range invariants.
 
 ## Writing Custom Adapters
 
