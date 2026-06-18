@@ -117,12 +117,16 @@ class OpenAIUsageAdapter {
   // ─────────────────────────────────────────────
 
   async _fetchUsage(startTs, endTs) {
-    const url = `${this._baseUrl}/usage/completions?start_time=${startTs}&end_time=${endTs}&bucket_width=1d&limit=31`;
+    // group_by[]=model is REQUIRED — without it the API returns a single bucket per
+    // day with no `model` field, so every row collapses to model='unknown'.
+    // Mirror the Anthropic adapter (which has group_by[]=model) so per-model
+    // breakdown actually works.
+    const url = `${this._baseUrl}/usage/completions?start_time=${startTs}&end_time=${endTs}&bucket_width=1d&group_by[]=model&limit=31`;
     return this._fetch(url);
   }
 
   async _fetchCosts(startTs, endTs) {
-    const url = `${this._baseUrl}/costs?start_time=${startTs}&end_time=${endTs}&bucket_width=1d&limit=31`;
+    const url = `${this._baseUrl}/costs?start_time=${startTs}&end_time=${endTs}&bucket_width=1d&group_by[]=model&limit=31`;
     return this._fetch(url);
   }
 
@@ -166,6 +170,8 @@ class OpenAIUsageAdapter {
         res.on('error', reject);
       });
       req.on('error', reject);
+      // 15s socket-deadline — OpenAI Org Usage API occasionally hangs on auth.
+      req.setTimeout(15_000, () => req.destroy(new Error(`OpenAI HTTP timeout (15s) for ${rawUrl}`)));
       req.end();
     });
   }

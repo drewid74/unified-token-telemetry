@@ -62,7 +62,7 @@ function httpGet(rawUrl) {
   return new Promise((resolve, reject) => {
     const parsed = new url.URL(rawUrl);
     const lib    = parsed.protocol === 'https:' ? https : http;
-    lib.get(rawUrl, res => {
+    const req = lib.get(rawUrl, res => {
       if (res.statusCode < 200 || res.statusCode >= 300) {
         reject(new Error(`HTTP ${res.statusCode} for ${rawUrl}`));
         res.resume();
@@ -70,9 +70,20 @@ function httpGet(rawUrl) {
       }
       const chunks = [];
       res.on('data',  c  => chunks.push(c));
-      res.on('end',   () => resolve(JSON.parse(Buffer.concat(chunks).toString())));
+      res.on('end',   () => {
+        // Guard JSON.parse — a non-JSON 2xx body (text health endpoint, HTML 502
+        // page from a transparent proxy) otherwise throws synchronously inside
+        // this event handler, becoming an uncaughtException that kills the
+        // daemon. Reject the promise instead.
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+        catch (e) { reject(new Error(`HTTP parse error for ${rawUrl}: ${e.message}`)); }
+      });
       res.on('error', reject);
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    // Socket-level deadline. Without this a TCP-established-but-silent server
+    // (Prometheus restart/compaction, half-open NAT) hangs the cycle forever.
+    req.setTimeout(15_000, () => req.destroy(new Error(`HTTP timeout (15s) for ${rawUrl}`)));
   });
 }
 
@@ -241,6 +252,167 @@ async function upsertRecords(pool, schema, records) {
 }
 
 // ─────────────────────────────────────────────
+// Freshness Check (Phase 1: T0.1 + D7)
+// ─────────────────────────────────────────────
+//
+// After every cycle, write one row per known source into watchdog_status.
+// A separate process (NAS-side bash script, k8s sidecar, whatever) reads
+// that table and alerts when status <> 'ok' for too long.
+//
+// Architecture decisions:
+//   - Thresholds are tuned to each source's actual cadence. A flat 30-min
+//     threshold would perma-stale anything that polls daily.
+//   - SOURCE_STATE_OVERRIDE lets you mark sources 'paused' (e.g., daemon
+//     installed but no credentials on this machine) so they don't perma-alert
+//     as 'never_seen' or 'stale'. See invariants.md §11.
+//   - __heartbeat__ is a synthetic row this function writes about itself —
+//     if it goes stale, the freshness checker itself is dead and every other
+//     'ok' row is suspect. See invariants.md §10 for the MAX(updated_at) bug
+//     that this layer surfaces.
+//
+// Tune SOURCE_THRESHOLDS_SECONDS to match your collection cadence. Defaults
+// below reflect a typical multi-source deployment.
+
+const SOURCE_THRESHOLDS_SECONDS = {
+  // High-frequency sources (15-min cycle or faster)
+  litellm:           30 * 60,        // 2x cycle interval
+  opencode:          45 * 60,        // 3x cycle interval (more tolerant of empty polls)
+
+  // Bursty sources (only write on activity; long quiet windows are normal)
+  copilot_otel:      24 * 3600,      // VS Code chat sessions
+  codex_cli:         24 * 3600,      // Codex CLI sessions
+
+  // Daily-cadence collectors (poll once per day)
+  anthropic_desktop: 30 * 3600,      // 1 day + 6h buffer
+  copilot:           30 * 3600,      // Copilot daily API
+  openai_api:        30 * 3600,      // OpenAI Org Usage API
+  anthropic_api:     30 * 3600,      // Anthropic Org Usage API
+
+  // Monthly cadence
+  subscription:      35 * 86400,     // monthly + 5d buffer
+
+  // Dead-man's-switch — must match the rollup cycle interval (2x)
+  __heartbeat__:     30 * 60,
+};
+
+// Per-source explicit state overrides. Use 'paused' for sources that are
+// CONFIGURED-BUT-NOT-OPERATING here (daemon installed but no credentials,
+// or no source data on this machine). See invariants.md §11.
+//
+// Each entry: { status: 'paused', message: 'actionable next step' }
+// Example values (uncomment + tune for YOUR deployment):
+//
+//   codex_cli:  { status: 'paused', message: 'no ~/.codex/sessions on this host; daemon has nothing to read' },
+//   openai_api: { status: 'paused', message: 'daemon requires OPENAI_ADMIN_KEY env var (not set)' },
+//   copilot:    { status: 'paused', message: 'daemon getting HTTP 403 from GitHub API — fix PAT scope/expiry/org' },
+//
+// Remove an entry once the source is genuinely operational; the regular
+// stale-detection logic will take over.
+const SOURCE_STATE_OVERRIDE = {
+  // Populate per-deployment.
+};
+
+const WATCHDOG_UPSERT_SQL = `
+INSERT INTO {{schema}}.watchdog_status (
+  source_system, status, threshold_seconds, stale_seconds,
+  last_ingest_at, last_check_at, message, checked_by
+) VALUES ($1,$2,$3,$4,$5,NOW(),$6,$7)
+ON CONFLICT (source_system) DO UPDATE SET
+  status            = EXCLUDED.status,
+  threshold_seconds = EXCLUDED.threshold_seconds,
+  stale_seconds     = EXCLUDED.stale_seconds,
+  last_ingest_at    = EXCLUDED.last_ingest_at,
+  last_check_at     = EXCLUDED.last_check_at,
+  message           = EXCLUDED.message,
+  checked_by        = EXCLUDED.checked_by
+`;
+
+/**
+ * Write one watchdog_status row per known source plus the synthetic
+ * __heartbeat__ row (proves the checker itself is alive).
+ *
+ * Failures here are non-fatal — they're logged and swallowed so a transient
+ * DB hiccup never crashes the worker (which would itself silently kill the
+ * freshness signal it's supposed to be reporting on).
+ *
+ * @param {Pool}   pool       pg.Pool against the brain DB
+ * @param {string} schema     schema name (typically 'public' or 'telemetry')
+ * @param {string} checkedBy  identifier for who ran this check (e.g., 'worker-15min')
+ */
+async function runFreshnessCheck(pool, schema, checkedBy = 'worker') {
+  const sources = Object.keys(SOURCE_THRESHOLDS_SECONDS).filter(s => s !== '__heartbeat__');
+  const upsertSql = WATCHDOG_UPSERT_SQL.replace(/\{\{schema\}\}/g, schema);
+
+  try {
+    // CRITICAL: MAX(updated_at), NOT MAX(created_at). Idempotent UPSERTs touch
+    // updated_at but never change created_at — using created_at would falsely
+    // report any replay-style daemon (e.g., one polling old session files for
+    // new tokens) as stale. See invariants.md §10.
+    const { rows } = await pool.query(
+      `SELECT source_system, MAX(updated_at) AS last_ingest_at
+         FROM ${schema}.token_usage
+        WHERE source_system = ANY($1)
+        GROUP BY source_system`,
+      [sources]
+    );
+    const lastIngestBySource = new Map(rows.map(r => [r.source_system, r.last_ingest_at]));
+
+    let okCount = 0, staleCount = 0, neverCount = 0, pausedCount = 0;
+
+    for (const src of sources) {
+      const threshold  = SOURCE_THRESHOLDS_SECONDS[src];
+      const lastIngest = lastIngestBySource.get(src);
+      const override   = SOURCE_STATE_OVERRIDE[src];
+
+      let status, staleSeconds, message;
+      if (override) {
+        // Explicit operator override — source intentionally not running here.
+        status = override.status;
+        staleSeconds = lastIngest
+          ? Math.floor((Date.now() - new Date(lastIngest).getTime()) / 1000)
+          : null;
+        message = override.message;
+        pausedCount++;
+      } else if (!lastIngest) {
+        status = 'never_seen';
+        staleSeconds = null;
+        message = `no rows for source_system='${src}' in ${schema}.token_usage`;
+        neverCount++;
+      } else {
+        staleSeconds = Math.floor((Date.now() - new Date(lastIngest).getTime()) / 1000);
+        if (staleSeconds > threshold) {
+          status = 'stale';
+          message = `${staleSeconds}s since last ingest exceeds threshold ${threshold}s`;
+          staleCount++;
+        } else {
+          status = 'ok';
+          message = `last ingest ${staleSeconds}s ago (threshold ${threshold}s)`;
+          okCount++;
+        }
+      }
+
+      await pool.query(upsertSql, [
+        src, status, threshold, staleSeconds, lastIngest, message, checkedBy,
+      ]);
+    }
+
+    // D7 — dead-man's-switch row. If this row's last_check_at exceeds its
+    // own threshold, the checker itself is dead and any 'ok' rows are
+    // stale-by-default.
+    await pool.query(upsertSql, [
+      '__heartbeat__', 'ok', SOURCE_THRESHOLDS_SECONDS.__heartbeat__,
+      0, new Date(), `checker alive; ran at ${new Date().toISOString()}`, checkedBy,
+    ]);
+
+    console.log(
+      `[watchdog] freshness check — ok=${okCount} stale=${staleCount} never_seen=${neverCount} paused=${pausedCount} + heartbeat`
+    );
+  } catch (err) {
+    console.error(`[watchdog] freshness check FAILED (non-fatal): ${err.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────
 // LiteLLM Adapter
 // ─────────────────────────────────────────────
 
@@ -328,9 +500,16 @@ async function runCollectionCycle(pool, cfg) {
   console.log(`[worker] cycle start — window: ${windowStart.toISOString()} → ${windowEnd.toISOString()}`);
 
   let totalUpserted = 0;
+  // Track per-source outcomes so main() can return a non-zero exit code on
+  // partial failure (invariant: cron monitoring must be able to detect that
+  // ONE source died while others succeeded — silent exit 0 hides bugs like
+  // the subscription enum violation or the OpenAI 'unknown' model collapse).
+  const sourceErrors = [];   // list of { source, error } from sources the cycle TRIED
+  const sourcesTried = [];   // list of source names that were enabled and attempted
 
   // LiteLLM source
   if (cfg.sources?.litellm?.enabled) {
+    sourcesTried.push('litellm');
     try {
       const records = await collectLiteLLM(cfg, windowStart, windowEnd, windowEndTs);
       console.log(`[litellm] collected ${records.length} records`);
@@ -340,16 +519,20 @@ async function runCollectionCycle(pool, cfg) {
       totalUpserted += count;
     } catch (err) {
       console.error(`[litellm] collection failed:`, err.message);
+      sourceErrors.push({ source: 'litellm', error: err.message });
     }
   }
 
   // Copilot source — stub; implement when GitHub token is configured
   if (cfg.sources?.copilot?.enabled) {
+    sourcesTried.push('copilot');
     console.warn('[copilot] adapter not yet implemented — skipping');
+    sourceErrors.push({ source: 'copilot', error: 'adapter not wired into worker' });
   }
 
   // OpenAI Organization Usage API source
   if (cfg.sources?.openai?.enabled) {
+    sourcesTried.push('openai');
     try {
       const OpenAIAdapter = require('./adapters/openai-usage.adapter.js');
       const adapter = new OpenAIAdapter(cfg);
@@ -370,11 +553,13 @@ async function runCollectionCycle(pool, cfg) {
       totalUpserted += count;
     } catch (err) {
       console.error(`[openai] collection failed:`, err.message);
+      sourceErrors.push({ source: 'openai', error: err.message });
     }
   }
 
   // Anthropic Organization Usage API source
   if (cfg.sources?.anthropic?.enabled) {
+    sourcesTried.push('anthropic');
     try {
       const AnthropicAdapter = require('./adapters/anthropic-usage.adapter.js');
       const adapter = new AnthropicAdapter(cfg);
@@ -395,11 +580,13 @@ async function runCollectionCycle(pool, cfg) {
       totalUpserted += count;
     } catch (err) {
       console.error(`[anthropic] collection failed:`, err.message);
+      sourceErrors.push({ source: 'anthropic', error: err.message });
     }
   }
 
   // Subscription flat-cost source (monthly billing records)
   if (cfg.sources?.subscriptions?.enabled) {
+    sourcesTried.push('subscriptions');
     try {
       const SubscriptionAdapter = require('./adapters/subscription.adapter.js');
       const adapter = new SubscriptionAdapter(cfg);
@@ -415,16 +602,34 @@ async function runCollectionCycle(pool, cfg) {
       totalUpserted += count;
     } catch (err) {
       console.error(`[subscriptions] collection failed:`, err.message);
+      sourceErrors.push({ source: 'subscriptions', error: err.message });
     }
   }
 
   // Manual import — stub
   if (cfg.sources?.manual?.enabled) {
+    sourcesTried.push('manual');
     console.warn('[manual] adapter not yet implemented — skipping');
+    sourceErrors.push({ source: 'manual', error: 'adapter not wired into worker' });
   }
 
-  console.log(`[worker] cycle complete — ${totalUpserted} total rows upserted`);
-  return totalUpserted;
+  if (sourceErrors.length > 0) {
+    console.error(
+      `[worker] cycle complete with ERRORS — upserted=${totalUpserted} ` +
+      `failed=${sourceErrors.length}/${sourcesTried.length} ` +
+      `sources_failed=[${sourceErrors.map(e => e.source).join(',')}]`
+    );
+  } else {
+    console.log(`[worker] cycle complete — ${totalUpserted} total rows upserted across ${sourcesTried.length} sources`);
+  }
+
+  // Phase 1 T0.1+D7: write per-source freshness rows + dead-man's-switch heartbeat.
+  // Always runs, even when 0 rows were upserted, so the __heartbeat__ row stays
+  // current and a zero-row cycle (legit empty Prometheus window) doesn't look
+  // like a stall. Failure here is non-fatal — see runFreshnessCheck() for why.
+  await runFreshnessCheck(pool, schema, 'worker');
+
+  return { totalUpserted, sourcesTried, sourceErrors };
 }
 
 // ─────────────────────────────────────────────
@@ -453,17 +658,42 @@ async function main() {
     }
   }
 
-  await runCollectionCycle(pool, cfg);
+  const cycleResult = await runCollectionCycle(pool, cfg);
 
   if (daemon) {
     const intervalMs = (cfg.scheduler?.interval_minutes || 60) * 60_000;
     console.log(`[worker] daemon — next run in ${cfg.scheduler?.interval_minutes || 60}m`);
+
+    // In-flight mutex: setInterval with an async callback does NOT await —
+    // if a cycle outruns the interval (initial seed, multi-day backfill, slow
+    // Prometheus), Node would otherwise start the next cycle concurrently.
+    // Both runs would read the same watermark and re-process the same windows
+    // (idempotent, but wasted work + doubled load on Prom). Skip overlapping
+    // ticks. See invariants.md §13 (the same insight applies to query_range
+    // backfill loops that can exceed cycle interval during initial seeds).
+    let cycleInFlight = false;
     setInterval(async () => {
+      if (cycleInFlight) {
+        console.warn('[worker] previous cycle still running — skipping this tick');
+        return;
+      }
+      cycleInFlight = true;
       try { await runCollectionCycle(pool, cfg); }
       catch (err) { console.error('[worker] cycle error:', err.message); }
+      finally   { cycleInFlight = false; }
     }, intervalMs);
   } else {
     await pool.end();
+    // Exit code matrix (for cron monitoring):
+    //   0 — all enabled sources succeeded (or no sources enabled)
+    //   1 — fatal/config error (reserved for the main().catch handler below)
+    //   2 — partial failure: cycle ran but at least one enabled source errored
+    // Without this, cron-based deployments silently see exit 0 even when
+    // every subscription upsert is throwing an enum error.
+    if (cycleResult.sourceErrors.length > 0) {
+      console.error(`[worker] EXIT 2 — partial failure (${cycleResult.sourceErrors.length}/${cycleResult.sourcesTried.length} sources failed)`);
+      process.exit(2);
+    }
     console.log('[worker] done');
     process.exit(0);
   }

@@ -186,6 +186,8 @@ class AnthropicUsageAdapter {
         res.on('error', reject);
       });
       req.on('error', reject);
+      // 15s socket-deadline — Anthropic Admin API can hang on auth probe.
+      req.setTimeout(15_000, () => req.destroy(new Error(`Anthropic HTTP timeout (15s) for ${rawUrl}`)));
       req.end();
     });
   }

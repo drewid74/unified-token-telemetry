@@ -87,6 +87,8 @@ function httpGet(rawUrl, headers = {}, _redirectDepth = 0) {
     });
 
     req.on('error', reject);
+    // 15s socket-deadline — GitHub CDN signed URLs occasionally stall mid-stream.
+    req.setTimeout(15_000, () => req.destroy(new Error(`HTTP timeout (15s) for ${rawUrl}`)));
   });
 }
 

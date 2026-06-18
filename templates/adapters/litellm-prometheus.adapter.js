@@ -9,7 +9,8 @@
  *   litellm_output_tokens_metric_total  {model, user}
  *   litellm_cached_tokens_metric_total  {model, user}  (cache reads only; no write metric)
  *
- * Job label: litellm_panopticon
+ * Job label: whatever you used in your scrape_configs (default 'litellm').
+ *            Override via config.sources.litellm.prometheus.job_name.
  */
 
 'use strict';
@@ -20,7 +21,7 @@ class LiteLLMPrometheusAdapter {
     this.sourceSystem = 'litellm';
     this.displayName  = 'LiteLLM (Prometheus)';
     this._prometheusUrl = config.sources.litellm.prometheus.url;
-    this._jobName       = config.sources.litellm.prometheus.job_name || 'litellm_panopticon';
+    this._jobName       = config.sources.litellm.prometheus.job_name || 'litellm';
     this._lastCounters  = new Map(); // model_id -> { input, output, cached }
   }
 

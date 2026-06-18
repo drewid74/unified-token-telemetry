@@ -23,7 +23,7 @@ sources:
     enabled: true
     prometheus:
       url: "${LITELLM_PROMETHEUS_URL}"  # Prometheus endpoint that scrapes LiteLLM
-      job_name: "litellm_panopticon"    # Prometheus job label for LiteLLM scrape target
+      job_name: "litellm"               # Prometheus job label for LiteLLM scrape target (whatever you used in scrape_configs)
     # Metrics queried:
     #   litellm_input_tokens_metric_total
     #   litellm_output_tokens_metric_total
@@ -162,9 +162,14 @@ pricing:
     #   cache_read_per_million: 0.30
 
 backfill:
-  enabled: false
-  default_start: "2024-01-01T00:00:00Z"  # ISO 8601; used if no prior data exists
-  max_days: 90                            # Don't backfill more than N days per run
+  # Phase 2 T0.8: backfill is now CODE-DRIVEN via the public.rollup_watermark
+  # table and Prometheus query_range. The keys below were historical config
+  # the original worker never read; kept here only as documentation of the
+  # mental model. Live cap is CONFIG.scheduler.max_backfill_minutes in the
+  # rollup script itself.
+  enabled: true
+  default_start: "2024-01-01T00:00:00Z"  # legacy — ignored; backfill resumes from rollup_watermark
+  max_days: 90                            # legacy — ignored; rollup uses max_backfill_minutes (default 1440 = 24h/cycle cap)
 
 verification:
   enabled: true

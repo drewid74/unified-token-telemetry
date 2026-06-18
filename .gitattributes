@@ -1,0 +1,18 @@
+# Ensure shell scripts always have LF line endings in the repo, regardless of
+# the platform that committed them. Without this, a script written on Windows
+# (CRLF) will fail on Linux with "bad interpreter: /usr/bin/env bash^M".
+*.sh text eol=lf
+
+# Same for Node scripts that may be run on Linux containers.
+*.js text eol=lf
+
+# SQL files — LF for portability.
+*.sql text eol=lf
+
+# Keep PowerShell scripts as CRLF (they're Windows-only).
+*.ps1 text eol=crlf
+
+# Binary / opaque files — let git auto-detect.
+*.png binary
+*.jpg binary
+*.gif binary

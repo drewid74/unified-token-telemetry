@@ -16,5 +16,9 @@
   "dependencies": {
     "js-yaml": "^4.1.0",
     "pg": "^8.21.0"
+  },
+  "//optionalDependencies": "better-sqlite3 is required ONLY by instances/drew/opencode-db-daemon.js. Optional because the core LiteLLM rollup does not need it; a failed install does not break npm install. The daemon will print 'No SQLite module found' at startup if missing.",
+  "optionalDependencies": {
+    "better-sqlite3": "^12.0.0"
   }
 }
